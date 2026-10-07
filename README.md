@@ -55,15 +55,56 @@ already covers them. No patch required.
 
 ## Coverage after patching
 
-| GLM tensor | Count | Reachable |
+Counts below are **verified** by `scripts/validate_glm_index.py`, which walks the
+real `model.safetensors.index.json` from the Hub. They are not estimates.
+
+Decoder stack only — the checkpoint also contains a 46th layer that is an MTP
+(multi-token-prediction) head, not a decoder layer. `num_nextn_predict_layers=1`
+in `config.json`; it is structurally near-identical to a decoder layer, so the
+validator separates and reports it explicitly rather than counting it in.
+
+| GLM tensor | Count | Reachable by |
 |---|---|---|
-| `self_attn.o_proj` | 46 | ✅ upstream |
-| `mlp.experts.*.down_proj` | 12,384 | ✅ upstream |
-| `mlp.shared_experts.down_proj` | 43 | ✅ **this fork** |
+| `self_attn.o_proj` | 45 | ✅ upstream |
+| `mlp.experts.*.down_proj` | 12,096 | ✅ upstream |
+| `mlp.shared_experts.down_proj` | 42 | ✅ **this fork** |
 | `mlp.down_proj` (dense, layers 0–2) | 3 | ✅ upstream |
 | `hyper_connection` (`hc_*`) | — | not a projection, skipped |
 
+- **45 decoder layers**: 3 dense (`first_k_dense_replace=3`) + 42 MoE.
+- **288 routed experts** per MoE layer (`n_routed_experts`), 8 active per token
+  (`num_experts_per_tok`), plus **1 shared expert** (`n_shared_experts`).
+- Arithmetic check enforced by the validator:
+  `42 × (288 + 1) + 3 = 12,141` ✅
+- **Total abliterable modules: 12,186** (`12,141` `mlp.down_proj` + 45
+  `attn.o_proj`).
+
 Components returned: `["attn.o_proj", "mlp.down_proj"]`
+
+### ⚠️ The checkpoint is FP8 — this is the bigger problem
+
+`config.json` declares `quantization_config.quant_method = "fp8"`, `fmt = "e4m3"`,
+`weight_block_size = [128, 128]`, dynamic activation scheme. The index confirms
+it: **12,152 of 12,186 ablation targets (99.7%) are FP8 with companion
+`.weight_scale_inv` block-scale tensors.** Only 34 targets are bf16 — exactly the
+`self_attn.o_proj` of the 34 `linear_attention` layers, which
+`modules_to_not_convert` excludes from quantization.
+
+What this means for heretic:
+
+- Direction extraction reads module weights and orthogonalizes them. FP8
+  e4m3 has ~2–3 decimal digits of precision and a 128×128 block scale that must
+  be applied consistently. Heretic's math assumes bf16/fp16 tensors.
+- Ablating a quantized tensor means dequantize → ablate → requantize, and the
+  result may not survive requantization without loss. Orthogonalizing an FP8
+  tensor in place risks corrupting the block structure.
+- This is **untested**. `p4de.24xlarge` (8× A100 80 GB) is still the right
+  hardware, but the first two hours should be a *load-and-ablate-one-layer* test,
+  not a full run.
+
+Concretely, the first GPU experiment should dequantize a single MoE layer's
+routed + shared `down_proj`, confirm the tensors reshape back cleanly, and only
+then attempt direction extraction on one module.
 
 ---
 
@@ -100,7 +141,8 @@ uv run python tests/test_glm_structure.py
 `tests/test_glm_structure.py` builds a synthetic GLM-shaped MoE block (routed
 experts + shared expert + `self_attn.o_proj`) — no 306 GB download — and asserts
 that `get_layers`, `get_layer_modules`, and `get_abliterable_components` discover
-the expected modules, including the shared expert.
+the expected modules, including the shared expert. It stubs `peft` and
+`bitsandbytes`, whose native extensions require CPU features some hosts lack.
 
 Expected output:
 
@@ -113,6 +155,45 @@ get_abliterable_components -> ['attn.o_proj', 'mlp.down_proj']
 PASS: GLM-5.x structure fully discoverable
 ```
 
+### Validating against the real index (no weights needed)
+
+`scripts/validate_glm_index.py` fetches only `config.json` and
+`model.safetensors.index.json` — a few hundred KB — and predicts heretic's
+component census from the checkpoint's own module paths:
+
+```bash
+uv run python scripts/validate_glm_index.py --repo zai-org/GLM-5.3-Flash
+```
+
+It cross-checks config against index (layer counts, expert counts, dense-layer
+layout), confirms each heretic probe resolves to a real module, separates the
+MTP head from the decoder stack, and reports the precision of every target.
+Exit code is non-zero on any inconsistency, so it is usable as a pre-flight
+check.
+
+Actual output for GLM-5.3-Flash:
+
+```
+layers present in index : 45  (0..44)
+MoE layers   : 42
+dense layers : 3  -> [0, 1, 2]
+MoE layers with shared_experts.down_proj: 42/42
+layers with self_attn.o_proj           : 45/45
+
+routed expert down_proj : 12,096
+shared expert down_proj : 42
+dense FFN down_proj     : 3
+TOTAL mlp.down_proj     : 12,141
+attn.o_proj             : 45
+TOTAL abliterable       : 12,186
+
+FP8 targets    : 12,152 / 12,186 (99.7%)
+arithmetic check: OK (12141)
+
+MTP heads detected outside the decoder stack: [45]
+PASS: index is consistent with config; heretic's probes resolve modules.
+```
+
 ### Loading the real model
 
 ```bash
@@ -120,18 +201,25 @@ uv run heretic --model zai-org/GLM-5.3-Flash --trust-remote-code
 ```
 
 On startup heretic prints the abliterable component census. For GLM-5.3-Flash
-you should see roughly:
+it should match the validator's prediction exactly:
 
 ```
 * Transformer model with 45 layers
 * Abliterable components:
-  * attn.o_proj: 46 modules total
-  * mlp.down_proj: 12430 modules total
+  * attn.o_proj: 45 modules total
+  * mlp.down_proj: 12141 modules total
 ```
 
-If `mlp.down_proj` reports ~12,387 instead of ~12,430, the shared-expert patch
-did not take effect. If the model fails to load at all, that's a
-`transformers` version issue — the config declares `transformers_version: 5.16.0`.
+Those two numbers are the cheapest possible proof that both patches took effect:
+the shared-expert patch is what turns `mlp.down_proj` from 12,099 into 12,141,
+and anything other than 45 layers means the MTP head leaked in or a decoder
+layer was missed. If the model fails to load at all, that is a `transformers`
+version issue — the config declares `transformers_version: 5.16.0`.
+
+**Before any full run**, load a single MoE layer and round-trip one quantized
+`down_proj` through dequantize → reshape → requantize. 99.7% of the targets are
+FP8; if that round-trip is lossy or shape-breaking, the ablation approach needs
+to change before you spend hours on it.
 
 ---
 

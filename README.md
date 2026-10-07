@@ -106,6 +106,12 @@ Concretely, the first GPU experiment should dequantize a single MoE layer's
 routed + shared `down_proj`, confirm the tensors reshape back cleanly, and only
 then attempt direction extraction on one module.
 
+### → [`GPU_TEST.md`](GPU_TEST.md) — exact commands to run when you have a GPU
+
+A four-step gated runbook: structural checks (no GPU), the FP8 round-trip probe
+(one GPU, this is the gate), the component census, then ablation and export.
+Include the printed output of any failing step when reporting back.
+
 ---
 
 ## Known open problem: 306 GiB residency

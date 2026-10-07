@@ -377,6 +377,15 @@ class Model:
         with suppress(Exception):
             return model.model.language_model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
 
+        # GLM-5.x: Glm5NextForConditionalGeneration nests the decoder one level
+        # deeper, as model.language_model.layers, but does not expose it under the
+        # multimodal `model.model.language_model` path above, so try the flat
+        # variant before falling back to the text-only path.
+        with suppress(Exception):
+            layers = model.model.language_model.layers
+            if len(layers) > 0:
+                return layers  # ty: ignore[unresolved-attribute, invalid-return-type]
+
         # Text-only models.
         return model.model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
 
@@ -443,6 +452,16 @@ class Model:
         with suppress(Exception):
             for expert in layer.moe.experts:  # ty:ignore[not-iterable, unresolved-attribute]
                 try_add("mlp.down_proj", expert.output_linear)  # ty: ignore[unresolved-attribute]
+
+        # GLM-5.x (Glm5NextForConditionalGeneration) MoE layers.
+        # GLM keeps a single always-active shared expert alongside the 288 routed
+        # experts. Because it fires on every token regardless of routing, its
+        # down_proj is one of the highest-value ablation targets in the model.
+        with suppress(Exception):
+            try_add(
+                "mlp.down_proj",
+                layer.mlp.shared_experts.down_proj,
+            )  # ty: ignore[unresolved-attribute]
 
         # We need at least one module across all components for abliteration to work.
         total_modules = sum(len(mods) for mods in modules.values())
